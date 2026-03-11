@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Cached machine data (may contain personal session data)
+cached-data/
+
+# Output files
+*.html
+!user-templates/*.html
