@@ -13,35 +13,50 @@ Merge Claude Code [`/insights`](https://claude.com/claude-code) across multiple 
 ## Setup
 
 ```bash
-cp claude-insights-merge.py ~/.local/bin/claude-insights-merge
-chmod +x ~/.local/bin/claude-insights-merge
+git clone https://github.com/andrewle8/claude-insights-merge.git
+cd claude-insights-merge
+cp config.example.json config.json
 ```
 
-Edit the `MACHINES` list at the top of the script:
+Edit `config.json` with your machines:
 
-```python
-MACHINES = [
+```json
+{
+  "machines": [
     {
-        "name": "My Mac",
-        "type": "local",
-        "claude_home": str(Path.home() / ".claude"),
+      "name": "My Mac",
+      "type": "local",
+      "claude_home": "~/.claude"
     },
     {
-        "name": "My Windows PC",
-        "type": "ssh",
-        "host": "user@hostname-or-ip",
-        "python": "python",          # "python3" on Linux
-        "claude_home": r"C:\Users\you\.claude",
+      "name": "My Windows PC",
+      "type": "ssh",
+      "host": "user@hostname-or-ip",
+      "python": "python",
+      "claude_home": "C:\\Users\\you\\.claude"
     },
     {
-        "name": "My Linux Box",
-        "type": "ssh",
-        "host": "user@hostname-or-ip",
-        "python": "python3",
-        "claude_home": "/home/you/.claude",
-    },
-]
+      "name": "My Linux Box",
+      "type": "ssh",
+      "host": "user@hostname-or-ip",
+      "python": "python3",
+      "claude_home": "/home/you/.claude"
+    }
+  ],
+  "claude_cmd": "claude",
+  "default_model": "sonnet"
+}
 ```
+
+`config.json` is gitignored so your SSH hosts stay private. Optional config keys:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `claude_cmd` | `"claude"` | Path to Claude CLI |
+| `default_model` | `"sonnet"` | Default AI model for narratives |
+| `output_dir` | system temp dir | Default output directory |
+
+If no `config.json` exists, the script falls back to local-only mode (current machine).
 
 Verify SSH works before running:
 
@@ -52,17 +67,18 @@ ssh -o ConnectTimeout=5 user@host echo ok
 ## Usage
 
 ```bash
-claude-insights-merge                          # full report (Sonnet narratives)
-claude-insights-merge --model opus             # use Opus for narratives
-claude-insights-merge --stats-only             # terminal output, no HTML
-claude-insights-merge --no-ai                  # charts only, skip narratives
-claude-insights-merge --machine Mac            # only this machine
-claude-insights-merge --output ~/report.html   # save to specific path
-claude-insights-merge --json                   # dump merged data as JSON
+python3 claude-insights-merge.py                            # full report (Sonnet narratives)
+python3 claude-insights-merge.py --detail max --model opus  # maximum detail with Opus
+python3 claude-insights-merge.py --stats-only               # terminal output, no HTML
+python3 claude-insights-merge.py --no-ai                    # charts only, skip narratives
+python3 claude-insights-merge.py --machine Mac              # only this machine
+python3 claude-insights-merge.py --output ~/report.html     # save to specific path
+python3 claude-insights-merge.py --json                     # dump merged data as JSON
 ```
 
 | Flag | Description |
 |------|-------------|
+| `--detail {normal,high,max}` | Detail level for AI analysis (default: normal) |
 | `--stats-only` | Terminal output only, no HTML |
 | `--no-ai` | Skip narratives, render charts only |
 | `--no-open` | Generate HTML but don't open browser |
@@ -71,11 +87,22 @@ claude-insights-merge --json                   # dump merged data as JSON
 | `--output PATH` | Save HTML to specific path |
 | `--json` | Dump merged quantitative data as JSON |
 
+### Detail levels
+
+| Level | Facets sent | Data included | AI output |
+|-------|------------|---------------|-----------|
+| `normal` | 75 most recent | Basic facet summaries | Standard report sections |
+| `high` | 150 most recent | + project paths, languages, tools per session | + more project areas, specific examples |
+| `max` | **All sessions** | + full project breakdown, first prompts, git commits, per-project goals/summaries | + project deep dives, cross-machine analysis, timeline narrative, quantified wins |
+
+`--detail max` sends every session with enriched metadata (project paths, first prompts, duration, lines changed, languages, tools) plus a full per-project breakdown to the AI. This produces the most comprehensive report possible — specific projects named, cross-machine workflow patterns identified, and chronological evolution analyzed.
+
 ### Example output
 
 ```
-$ claude-insights-merge --stats-only
+$ python3 claude-insights-merge.py --stats-only
 
+  Loaded config from config.json (3 machines)
   Collecting from 3 machines in parallel...
   MBA M3:       Stats: OK, Facets: 147, Meta: 266
   14900K Win11: Stats: OK, Facets: 200, Meta: 337
@@ -95,30 +122,35 @@ $ claude-insights-merge --stats-only
 
 ## How It Works
 
-1. **Collect** — Reads `/insights` data from each machine (facets, session-meta, stats-cache)
+1. **Collect** — Reads `/insights` data from each machine in parallel (facets, session-meta, stats-cache)
 2. **Merge** — Deduplicates by session ID, aggregates tools, languages, outcomes, satisfaction, friction
-3. **Analyze** — Sends merged data to `claude -p` for narrative generation
-4. **Render** — Outputs a self-contained HTML page
+3. **Enrich** — Joins session-meta to facets (project paths, first prompts, durations, git activity)
+4. **Analyze** — Sends merged data to `claude -p` for narrative generation
+5. **Render** — Outputs a self-contained HTML page
 
 ### Data sources
 
 | File | Path | Contains |
 |------|------|----------|
 | Facets | `~/.claude/usage-data/facets/*.json` | Per-session goals, outcomes, satisfaction, friction |
-| Session-meta | `~/.claude/usage-data/session-meta/*.json` | Per-session tools, languages, tokens, timing |
+| Session-meta | `~/.claude/usage-data/session-meta/*.json` | Per-session project path, tools, languages, tokens, timing, first prompt |
 | Stats-cache | `~/.claude/stats-cache.json` | Daily activity, model usage, session counts |
 
 ### Beyond standard `/insights`
 
+- **Cross-machine merge** — unified view across all your development machines
 - **Per-machine breakdown** — message counts, session counts, contribution %
-- **Multi-clauding detection** — finds overlapping sessions across merged data
-- **Merged stats** — tool usage, languages, friction, and outcomes across all machines
+- **Per-project breakdown** (high/max) — every project with lines changed, tools used, goals, and outcomes
+- **Project deep dives** (max) — what was built, tech stack, impact, and status per project
+- **Cross-machine patterns** (max) — which projects live where, machine roles
+- **Timeline narrative** (max) — how your work evolved chronologically
+- **Multi-clauding detection** — finds overlapping parallel sessions across merged data
 
 ## Output
 
 Reports save to:
-- `$TMPDIR/claude-insights-combined-YYYY-MM-DD.html`
-- `~/.claude/insights/combined-YYYY-MM-DD.html` (persistent copy)
+- `$TMPDIR/claude-insights-combined-YYYY-MM-DD.html` (or `--output PATH`)
+- `~/.claude/insights/combined-YYYY-MM-DD.html` (persistent backup)
 
 ## Related
 
