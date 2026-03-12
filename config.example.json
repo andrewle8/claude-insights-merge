@@ -1,0 +1,26 @@
+{
+  "machines": [
+    {
+      "name": "My Mac",
+      "type": "local",
+      "claude_home": "~/.claude"
+    },
+    {
+      "name": "My Windows PC",
+      "type": "ssh",
+      "host": "user@hostname-or-ip",
+      "python": "python",
+      "claude_home": "C:\\Users\\you\\.claude"
+    },
+    {
+      "name": "My Linux Box",
+      "type": "ssh",
+      "host": "user@hostname-or-ip",
+      "python": "python3",
+      "claude_home": "/home/you/.claude"
+    }
+  ],
+  "claude_cmd": "claude",
+  "default_model": "sonnet",
+  "output_dir": "/tmp"
+}

@@ -34,33 +34,41 @@ from pathlib import Path
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
-# Edit this list to match your machines.
-# "type": "local" reads from the local filesystem; "type": "ssh" connects via SSH.
-MACHINES = [
+# Default machines list — used when no config.json is found.
+# For personal use, create a config.json file (see config.example.json).
+_DEFAULT_MACHINES = [
     {
         "name": "My Mac",
         "type": "local",
         "claude_home": str(Path.home() / ".claude"),
     },
-    # {
-    #     "name": "My Windows PC",
-    #     "type": "ssh",
-    #     "host": "user@hostname-or-ip",
-    #     "python": "python",
-    #     "claude_home": r"C:\Users\you\.claude",
-    # },
-    # {
-    #     "name": "My Linux Box",
-    #     "type": "ssh",
-    #     "host": "user@hostname-or-ip",
-    #     "python": "python3",
-    #     "claude_home": "/home/you/.claude",
-    # },
 ]
 
-CLAUDE_CMD = "claude"
-NARRATIVE_MODEL = "sonnet"
-OUTPUT_DIR = Path(tempfile.gettempdir())
+
+def _load_config():
+    """Load machines from config.json if it exists, otherwise use defaults."""
+    script_dir = Path(__file__).resolve().parent
+    config_file = script_dir / "config.json"
+    if config_file.exists():
+        try:
+            with open(config_file) as f:
+                config = json.load(f)
+            machines = config.get("machines", _DEFAULT_MACHINES)
+            # Expand ~ in claude_home paths
+            for m in machines:
+                if "claude_home" in m:
+                    m["claude_home"] = str(Path(m["claude_home"]).expanduser())
+            print(f"  Loaded config from {config_file} ({len(machines)} machines)")
+            return machines, config
+        except (json.JSONDecodeError, Exception) as e:
+            print(f"  Warning: Failed to load {config_file}: {e}", file=sys.stderr)
+    return _DEFAULT_MACHINES[:], {}
+
+
+MACHINES, _CONFIG = _load_config()
+CLAUDE_CMD = _CONFIG.get("claude_cmd", "claude")
+NARRATIVE_MODEL = _CONFIG.get("default_model", "sonnet")
+OUTPUT_DIR = Path(_CONFIG.get("output_dir", tempfile.gettempdir()))
 
 # ─── SSH Helpers ─────────────────────────────────────────────────────────────
 
