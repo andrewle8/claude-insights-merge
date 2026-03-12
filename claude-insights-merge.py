@@ -470,16 +470,106 @@ def aggregate_all(machine_data):
 
 # ─── AI Narrative Generation ─────────────────────────────────────────────────
 
-def build_ai_prompt(agg, machine_data):
+def _build_project_breakdown(agg):
+    """Build per-project breakdown from session-meta, keyed by project path."""
+    projects = defaultdict(lambda: {
+        "sessions": 0, "messages": 0, "lines_added": 0, "lines_removed": 0,
+        "files_modified": 0, "duration_minutes": 0, "tools": defaultdict(int),
+        "languages": defaultdict(int), "machines": set(), "first_prompts": [],
+        "goals": [], "outcomes": defaultdict(int), "git_commits": 0,
+        "git_pushes": 0, "summaries": [],
+    })
+
+    # Index facets by session_id for fast lookup
+    facet_by_sid = {f.get("session_id", ""): f for f in agg.get("facets", [])}
+
+    for meta in agg.get("session_meta", []):
+        path = meta.get("project_path", "unknown")
+        proj = projects[path]
+        proj["sessions"] += 1
+        proj["messages"] += meta.get("user_message_count", 0) + meta.get("assistant_message_count", 0)
+        proj["lines_added"] += meta.get("lines_added", 0)
+        proj["lines_removed"] += meta.get("lines_removed", 0)
+        proj["files_modified"] += meta.get("files_modified", 0)
+        proj["duration_minutes"] += meta.get("duration_minutes", 0)
+        proj["git_commits"] += meta.get("git_commits", 0)
+        proj["git_pushes"] += meta.get("git_pushes", 0)
+        for tool, count in meta.get("tool_counts", {}).items():
+            proj["tools"][tool] += count
+        for lang, count in meta.get("languages", {}).items():
+            proj["languages"][lang] += count
+        proj["machines"].add(meta.get("_machine", "unknown"))
+        fp = meta.get("first_prompt", "")
+        if fp and fp != "No prompt" and len(fp) > 5:
+            proj["first_prompts"].append(fp[:200])
+
+        # Pull in facet data for this session
+        sid = meta.get("session_id", "")
+        facet = facet_by_sid.get(sid)
+        if facet:
+            goal = facet.get("underlying_goal", "")
+            if goal:
+                proj["goals"].append(goal)
+            proj["outcomes"][facet.get("outcome", "unknown")] += 1
+            summary = facet.get("brief_summary", "")
+            if summary:
+                proj["summaries"].append(summary)
+
+    # Convert to serializable format, sorted by session count
+    result = []
+    for path, data in sorted(projects.items(), key=lambda x: x[1]["sessions"], reverse=True):
+        # Extract short project name from path
+        name = path.rstrip("/").split("/")[-1] if "/" in path else path
+        if name in ("andrewle", "andrew"):
+            name = f"~home ({path})"
+
+        result.append({
+            "path": path,
+            "name": name,
+            "sessions": data["sessions"],
+            "messages": data["messages"],
+            "lines_added": data["lines_added"],
+            "lines_removed": data["lines_removed"],
+            "files_modified": data["files_modified"],
+            "duration_hours": round(data["duration_minutes"] / 60, 1),
+            "git_commits": data["git_commits"],
+            "git_pushes": data["git_pushes"],
+            "top_tools": dict(sorted(data["tools"].items(), key=lambda x: x[1], reverse=True)[:5]),
+            "languages": dict(sorted(data["languages"].items(), key=lambda x: x[1], reverse=True)[:5]),
+            "machines": sorted(data["machines"]),
+            "sample_prompts": data["first_prompts"][:5],
+            "goals": data["goals"][:8],
+            "outcomes": dict(data["outcomes"]),
+            "summaries": data["summaries"][:6],
+        })
+
+    return result
+
+
+def build_ai_prompt(agg, machine_data, detail_level="normal"):
     """Build the prompt for narrative generation."""
     machines_str = ", ".join(m["name"] for m in machine_data)
 
-    # Summarize facets for the prompt — cap at 75 most recent to keep prompt manageable
-    # (the built-in /insights uses ~50 sessions for narrative generation)
-    recent_facets = agg["facets"][-75:]
+    # Determine facet cap based on detail level
+    if detail_level == "max":
+        facet_cap = None  # No cap — send all
+    elif detail_level == "high":
+        facet_cap = 150
+    else:
+        facet_cap = 75
+
+    # Build session-meta index for enrichment
+    meta_by_sid = {m.get("session_id", ""): m for m in agg.get("session_meta", [])}
+
+    # Select facets
+    if facet_cap is not None:
+        recent_facets = agg["facets"][-facet_cap:]
+    else:
+        recent_facets = agg["facets"]
+
     facet_summaries = []
     for f in recent_facets:
-        facet_summaries.append({
+        entry = {
             "machine": f.get("_machine", "unknown"),
             "goal": f.get("underlying_goal", ""),
             "outcome": f.get("outcome", ""),
@@ -489,7 +579,28 @@ def build_ai_prompt(agg, machine_data):
             "friction_detail": f.get("friction_detail", ""),
             "success": f.get("primary_success", ""),
             "summary": f.get("brief_summary", ""),
-        })
+        }
+
+        # Enrich with session-meta data (project path, first prompt, etc.)
+        sid = f.get("session_id", "")
+        meta = meta_by_sid.get(sid, {})
+        if meta:
+            entry["project_path"] = meta.get("project_path", "")
+            fp = meta.get("first_prompt", "")
+            if fp and fp != "No prompt":
+                entry["first_prompt"] = fp[:300] if detail_level == "max" else fp[:150]
+            entry["duration_min"] = meta.get("duration_minutes", 0)
+            entry["lines_changed"] = f"+{meta.get('lines_added', 0)}/-{meta.get('lines_removed', 0)}"
+            if detail_level in ("high", "max"):
+                entry["languages"] = meta.get("languages", {})
+                entry["tools_used"] = dict(sorted(
+                    meta.get("tool_counts", {}).items(),
+                    key=lambda x: x[1], reverse=True
+                )[:5])
+                entry["git_commits"] = meta.get("git_commits", 0)
+                entry["files_modified"] = meta.get("files_modified", 0)
+
+        facet_summaries.append(entry)
 
     stats_summary = {
         "machines": machines_str,
@@ -511,72 +622,190 @@ def build_ai_prompt(agg, machine_data):
         "total_facets_analyzed": agg["total_facets"],
     }
 
-    prompt = f"""You are analyzing a Claude Code power user's activity across {len(machine_data)} machines to generate a comprehensive insights report. The data comes from pre-computed /insights facets merged across all machines.
+    # Build per-project breakdown for high/max detail
+    project_section = ""
+    if detail_level in ("high", "max"):
+        project_breakdown = _build_project_breakdown(agg)
+        project_section = (
+            "\n## Per-Project Breakdown (" + str(len(project_breakdown)) + " projects)\n"
+            + json.dumps(project_breakdown, indent=2, default=str) + "\n"
+        )
 
-## Aggregated Stats
-{json.dumps(stats_summary, indent=2)}
-
-## Per-Session Facets ({len(facet_summaries)} sessions analyzed)
-{json.dumps(facet_summaries, indent=2, default=str)}
-
-## Instructions
-
-Generate a comprehensive insights analysis as a JSON object. Be specific, reference actual projects and patterns from the facet summaries. Be honest about friction. The tone should be direct and personalized.
-
-Respond with ONLY a JSON object (no markdown fencing) with these exact keys:
-
-{{
-  "at_a_glance": {{
-    "working": "<2-3 sentences>",
-    "hindering": "<2-3 sentences>",
-    "quick_wins": "<2-3 sentences>",
-    "ambitious": "<2-3 sentences>"
-  }},
-  "project_areas": [
-    {{"name": "<name>", "session_count": "<~N sessions>", "description": "<2-3 sentences>"}}
-  ],
-  "usage_narrative": {{
-    "paragraph1": "<analysis paragraph>",
-    "paragraph2": "<deeper analysis>",
-    "key_insight": "<one sentence key pattern>"
-  }},
-  "big_wins": [
-    {{"title": "<achievement>", "description": "<2-3 sentences>"}}
-  ],
-  "friction_intro": "<1 sentence summary>",
-  "friction_categories": [
-    {{"title": "<type>", "description": "<advice>", "examples": ["<specific example>"]}}
-  ],
-  "claude_md_suggestions": [
-    {{"code": "<rule>", "why": "<reason>"}}
-  ],
-  "features": [
-    {{"title": "<name>", "oneliner": "<one line>", "why": "<personalized reason>", "code": "<example>"}}
-  ],
-  "patterns": [
-    {{"title": "<pattern>", "summary": "<one line>", "detail": "<2-3 sentences>", "prompt": "<paste-into-claude prompt>"}}
-  ],
-  "horizon": [
-    {{"title": "<possibility>", "possible": "<2-3 sentences>", "tip": "<getting started>", "prompt": "<paste prompt>"}}
-  ],
-  "fun_ending": {{
-    "headline": "<funny one-liner in quotes>",
-    "detail": "<2-3 sentence elaboration>"
-  }}
-}}
-
-Important:
-- Reference specific projects and patterns from the facet data
-- This user works across {len(machine_data)} machines: {machines_str}
-- Be personalized, not generic"""
+    prompt = _build_prompt_text(
+        machines_str, len(machine_data), stats_summary, project_section,
+        facet_summaries, detail_level,
+    )
 
     return prompt
 
 
-def generate_narratives(agg, machine_data):
+def _build_prompt_text(machines_str, machine_count, stats_summary, project_section,
+                       facet_summaries, detail_level):
+    """Build the actual prompt text. Separated to avoid f-string brace issues."""
+    stats_json = json.dumps(stats_summary, indent=2)
+    facets_json = json.dumps(facet_summaries, indent=2, default=str)
+    facet_count = len(facet_summaries)
+
+    parts = []
+    parts.append(
+        f"You are analyzing a Claude Code power user's activity across {machine_count} "
+        f"machines to generate a comprehensive insights report. The data comes from "
+        f"pre-computed /insights facets merged across all machines."
+    )
+    parts.append(f"\n\n## Aggregated Stats\n{stats_json}")
+
+    if project_section:
+        parts.append(project_section)
+
+    parts.append(f"\n\n## Per-Session Facets ({facet_count} sessions analyzed)\n{facets_json}")
+
+    parts.append("\n\n## Instructions\n\n")
+    parts.append(
+        "Generate a comprehensive insights analysis as a JSON object. "
+        "Be specific, reference actual projects and patterns from the facet summaries. "
+        "Be honest about friction. The tone should be direct and personalized.\n\n"
+    )
+
+    if detail_level == "max":
+        parts.append("""MAXIMUM DETAIL MODE — This report should be exhaustive and deeply personalized:
+- Include a "project_deep_dives" array with EVERY project that has 2+ sessions. Each entry must describe what was specifically built, configured, or debugged in that project. Use the project paths, first prompts, goals, and summaries to reconstruct what happened.
+- Include "cross_machine_patterns" analyzing how work distributes across machines.
+- Include "timeline_narrative" showing how the user's work evolved over time.
+- For "big_wins", reference specific projects and quantify impact (lines changed, files modified).
+- For "friction_categories", include "affected_projects" showing which projects hit each friction type.
+- "project_areas" should STILL be included as a higher-level grouping (e.g., "Homelab/Infrastructure", "Web Development", "AI/ML Pipelines") in addition to the per-project deep dives.
+- Be VERY specific — name actual projects, reference actual prompts and goals from the data. No generic filler.
+- Generate at least 8-12 project_deep_dives, 5-8 big_wins, 4-6 friction_categories, 5-8 patterns.
+
+""")
+    elif detail_level == "high":
+        parts.append("""HIGH DETAIL MODE — Provide more thorough analysis than default:
+- Include more project_areas (8-12 instead of 4-6).
+- Reference specific project paths and what was built there.
+- Provide 4-6 big_wins with project references.
+- Be specific about friction with real examples.
+
+""")
+
+    parts.append("Respond with ONLY a JSON object (no markdown fencing) with these exact keys:\n\n")
+
+    if detail_level == "max":
+        parts.append("""{
+  "at_a_glance": {
+    "working": "<4-6 sentences>",
+    "hindering": "<4-6 sentences>",
+    "quick_wins": "<4-6 sentences>",
+    "ambitious": "<4-6 sentences>"
+  },
+  "project_deep_dives": [
+    {
+      "name": "<project name>",
+      "path": "<full path>",
+      "session_count": "<~N sessions>",
+      "machines": ["<machine names>"],
+      "description": "<3-5 sentences with specific details about what was built/fixed/configured>",
+      "key_work": ["<specific thing built/fixed #1>", "<#2>", "<#3>"],
+      "tech_stack": "<languages, frameworks, tools used>",
+      "impact": "<lines changed, files modified, commits — quantified>",
+      "status": "<ongoing/completed/paused — based on recency>"
+    }
+  ],
+  "project_areas": [
+    {"name": "<high-level category name>", "session_count": "<~N sessions>", "projects": ["<project1>", "<project2>"], "description": "<3-5 sentences>"}
+  ],
+  "cross_machine_patterns": {
+    "paragraph": "<5-8 sentence analysis of how work flows between machines — which projects live where, any cross-machine workflows>",
+    "machine_roles": [
+      {"machine": "<name>", "primary_use": "<what this machine is mainly used for>", "top_projects": ["<project>"]}
+    ]
+  },
+  "usage_narrative": {
+    "paragraph1": "<5-8 sentence detailed analysis>",
+    "paragraph2": "<5-8 sentence deeper analysis of workflow evolution over time>",
+    "paragraph3": "<5-8 sentence analysis of tool usage patterns and coding style>",
+    "key_insight": "<one sentence key pattern>"
+  },
+  "big_wins": [
+    {"title": "<achievement>", "project": "<which project>", "description": "<3-4 sentences, reference specific code changes and outcomes>"}
+  ],
+  "timeline_narrative": "<5-8 sentence analysis about how the user's work has evolved chronologically — early vs recent sessions, shifting focus areas>",
+  "friction_intro": "<2-3 sentence summary>",
+  "friction_categories": [
+    {"title": "<type>", "description": "<2-3 sentences with specific session examples>", "examples": ["<specific example from a real session>"], "affected_projects": ["<project>"]}
+  ],
+  "claude_md_suggestions": [
+    {"code": "<rule>", "why": "<reason referencing specific project or pattern>"}
+  ],
+  "features": [
+    {"title": "<name>", "oneliner": "<one line>", "why": "<personalized reason referencing specific project>", "code": "<example>"}
+  ],
+  "patterns": [
+    {"title": "<pattern>", "summary": "<one line>", "detail": "<4-6 sentences>", "prompt": "<paste-into-claude prompt>"}
+  ],
+  "horizon": [
+    {"title": "<possibility>", "possible": "<4-6 sentences>", "tip": "<getting started>", "prompt": "<paste prompt>"}
+  ],
+  "fun_ending": {
+    "headline": "<funny one-liner in quotes>",
+    "detail": "<4-6 sentence elaboration>"
+  }
+}""")
+    else:
+        parts.append("""{
+  "at_a_glance": {
+    "working": "<2-3 sentences>",
+    "hindering": "<2-3 sentences>",
+    "quick_wins": "<2-3 sentences>",
+    "ambitious": "<2-3 sentences>"
+  },
+  "project_areas": [
+    {"name": "<name>", "session_count": "<~N sessions>", "description": "<2-3 sentences>"}
+  ],
+  "usage_narrative": {
+    "paragraph1": "<analysis paragraph>",
+    "paragraph2": "<deeper analysis>",
+    "key_insight": "<one sentence key pattern>"
+  },
+  "big_wins": [
+    {"title": "<achievement>", "description": "<2-3 sentences>"}
+  ],
+  "friction_intro": "<1 sentence summary>",
+  "friction_categories": [
+    {"title": "<type>", "description": "<advice>", "examples": ["<specific example>"]}
+  ],
+  "claude_md_suggestions": [
+    {"code": "<rule>", "why": "<reason>"}
+  ],
+  "features": [
+    {"title": "<name>", "oneliner": "<one line>", "why": "<personalized reason>", "code": "<example>"}
+  ],
+  "patterns": [
+    {"title": "<pattern>", "summary": "<one line>", "detail": "<2-3 sentences>", "prompt": "<paste-into-claude prompt>"}
+  ],
+  "horizon": [
+    {"title": "<possibility>", "possible": "<2-3 sentences>", "tip": "<getting started>", "prompt": "<paste prompt>"}
+  ],
+  "fun_ending": {
+    "headline": "<funny one-liner in quotes>",
+    "detail": "<2-3 sentence elaboration>"
+  }
+}""")
+
+    parts.append(f"""
+
+Important:
+- Reference specific projects and patterns from the facet data
+- This user works across {machine_count} machines: {machines_str}
+- Each session includes project_path showing which repo/directory was active
+- Be personalized, not generic — use the actual project names, goals, and summaries""")
+
+    return "".join(parts)
+
+
+def generate_narratives(agg, machine_data, detail_level="normal"):
     """Call claude -p to generate AI narrative sections."""
-    print("  Generating AI narrative analysis...")
-    prompt = build_ai_prompt(agg, machine_data)
+    print(f"  Generating AI narrative analysis (detail={detail_level})...")
+    prompt = build_ai_prompt(agg, machine_data, detail_level=detail_level)
 
     try:
         env = os.environ.copy()
@@ -591,7 +820,8 @@ def generate_narratives(agg, machine_data):
                 "--output-format", "json",
             ],
             input=prompt,
-            capture_output=True, text=True, timeout=600,
+            capture_output=True, text=True,
+            timeout=900 if detail_level == "max" else 600,
             env=env,
         )
 
@@ -697,6 +927,10 @@ def render_html(agg, machine_data, narratives):
     horizon = n.get("horizon", [])
     fun = n.get("fun_ending", {})
     claude_md = n.get("claude_md_suggestions", [])
+    # Max-detail fields
+    deep_dives = n.get("project_deep_dives", [])
+    cross_machine = n.get("cross_machine_patterns", {})
+    timeline = n.get("timeline_narrative", "")
 
     # Stats
     total_msgs = agg["totalMessages"]
@@ -758,24 +992,76 @@ def render_html(agg, machine_data, narratives):
       <span class="area-count">{esc(a.get("session_count",""))}</span></div>
       <div class="area-desc">{esc(a.get("description",""))}</div></div>''' for a in areas)
 
+    # Project deep dives (max detail)
+    deep_dives_html = ""
+    if deep_dives:
+        dd_items = ""
+        for dd in deep_dives:
+            machines_list = ", ".join(dd.get("machines", []))
+            key_work_items = "".join(f"<li>{esc(kw)}</li>" for kw in dd.get("key_work", []))
+            dd_items += f'''<div class="deep-dive-card">
+              <div class="dd-header">
+                <span class="dd-name">{esc(dd.get("name",""))}</span>
+                <span class="dd-meta">{esc(dd.get("session_count",""))} &bull; {esc(machines_list)}</span>
+              </div>
+              <div class="dd-path"><code>{esc(dd.get("path",""))}</code></div>
+              <div class="dd-desc">{esc(dd.get("description",""))}</div>
+              <div class="dd-details">
+                <div class="dd-detail"><strong>Key work:</strong><ul>{key_work_items}</ul></div>
+                <div class="dd-detail"><strong>Tech:</strong> {esc(dd.get("tech_stack",""))}</div>
+                <div class="dd-detail"><strong>Impact:</strong> {esc(dd.get("impact",""))}</div>
+                <div class="dd-detail"><strong>Status:</strong> {esc(dd.get("status",""))}</div>
+              </div>
+            </div>'''
+        deep_dives_html = f'''<h2 id="section-deep-dives">Project Deep Dives</h2>
+    <div class="deep-dives">{dd_items}</div>'''
+
+    # Cross-machine patterns (max detail)
+    cross_machine_html = ""
+    if cross_machine:
+        roles_html = ""
+        for role in cross_machine.get("machine_roles", []):
+            top_projs = ", ".join(role.get("top_projects", []))
+            roles_html += f'''<div class="machine-role">
+              <strong>{esc(role.get("machine",""))}</strong>: {esc(role.get("primary_use",""))}
+              <span class="role-projects">({esc(top_projs)})</span></div>'''
+        cross_machine_html = f'''<div class="cross-machine-section">
+      <div class="narrative"><p>{esc(cross_machine.get("paragraph",""))}</p></div>
+      <div class="machine-roles">{roles_html}</div></div>'''
+
+    # Timeline narrative (max detail)
+    timeline_html = ""
+    if timeline:
+        timeline_html = f'''<h2 id="section-timeline">Evolution Over Time</h2>
+    <div class="narrative"><p>{esc(timeline)}</p></div>'''
+
     # Usage narrative
     usage_html = ""
     if usage:
+        paragraphs = f'<p>{esc(usage.get("paragraph1",""))}</p><p>{esc(usage.get("paragraph2",""))}</p>'
+        if usage.get("paragraph3"):
+            paragraphs += f'<p>{esc(usage.get("paragraph3",""))}</p>'
         usage_html = f'''<div class="narrative">
-      <p>{esc(usage.get("paragraph1",""))}</p><p>{esc(usage.get("paragraph2",""))}</p>
+      {paragraphs}
       <div class="key-insight"><strong>Key pattern:</strong> {esc(usage.get("key_insight",""))}</div></div>'''
 
     # Big wins
-    wins_html = "".join(f'''<div class="big-win"><div class="big-win-title">{esc(w.get("title",""))}</div>
-      <div class="big-win-desc">{esc(w.get("description",""))}</div></div>''' for w in wins)
+    wins_html = ""
+    for w in wins:
+        project_tag = f' <span class="win-project">({esc(w.get("project",""))})</span>' if w.get("project") else ""
+        wins_html += f'''<div class="big-win"><div class="big-win-title">{esc(w.get("title",""))}{project_tag}</div>
+      <div class="big-win-desc">{esc(w.get("description",""))}</div></div>'''
 
     # Friction
     friction_html = ""
     for fc in friction_cats:
         examples = "".join(f"<li>{esc(ex)}</li>" for ex in fc.get("examples", []))
+        affected = ""
+        if fc.get("affected_projects"):
+            affected = f'<div class="friction-projects"><strong>Affected:</strong> {esc(", ".join(fc["affected_projects"]))}</div>'
         friction_html += f'''<div class="friction-category"><div class="friction-title">{esc(fc.get("title",""))}</div>
           <div class="friction-desc">{esc(fc.get("description",""))}</div>
-          <ul class="friction-examples">{examples}</ul></div>'''
+          <ul class="friction-examples">{examples}</ul>{affected}</div>'''
 
     # CLAUDE.md suggestions
     claude_md_html = ""
@@ -923,6 +1209,24 @@ def render_html(agg, machine_data, narratives):
     .fun-ending {{ background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%); border: 1px solid #fbbf24; border-radius: 12px; padding: 24px; margin-top: 40px; text-align: center; }}
     .fun-headline {{ font-size: 18px; font-weight: 600; color: #78350f; margin-bottom: 8px; }}
     .fun-detail {{ font-size: 14px; color: #92400e; }}
+    .deep-dives {{ display: flex; flex-direction: column; gap: 16px; margin: 16px 0 32px 0; }}
+    .deep-dive-card {{ background: white; border: 1px solid #e2e8f0; border-radius: 8px; padding: 16px; border-left: 4px solid #6366f1; }}
+    .dd-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }}
+    .dd-name {{ font-weight: 700; font-size: 16px; color: #0f172a; }}
+    .dd-meta {{ font-size: 12px; color: #64748b; background: #f1f5f9; padding: 2px 10px; border-radius: 4px; }}
+    .dd-path {{ font-size: 12px; color: #94a3b8; margin-bottom: 8px; }}
+    .dd-path code {{ font-family: monospace; background: #f8fafc; padding: 2px 6px; border-radius: 3px; }}
+    .dd-desc {{ font-size: 14px; color: #475569; line-height: 1.6; margin-bottom: 10px; }}
+    .dd-details {{ display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: #334155; }}
+    .dd-detail {{ line-height: 1.5; }}
+    .dd-detail ul {{ margin: 4px 0 0 20px; }}
+    .dd-detail li {{ margin-bottom: 3px; }}
+    .cross-machine-section {{ margin: 16px 0 32px 0; }}
+    .machine-roles {{ display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }}
+    .machine-role {{ background: #f0f9ff; border: 1px solid #bae6fd; border-radius: 8px; padding: 10px 14px; font-size: 14px; color: #0c4a6e; }}
+    .role-projects {{ font-size: 12px; color: #64748b; margin-left: 4px; }}
+    .win-project {{ font-size: 12px; color: #64748b; font-weight: 400; }}
+    .friction-projects {{ font-size: 12px; color: #7f1d1d; margin-top: 8px; }}
     @media (max-width: 640px) {{ .charts-row {{ grid-template-columns: 1fr; }} .stats-row {{ justify-content: center; }} }}
   </style>
 </head>
@@ -936,6 +1240,8 @@ def render_html(agg, machine_data, narratives):
     <nav class="nav-toc">
       <a href="#section-machines">Machines</a>
       <a href="#section-work">What You Work On</a>
+      {"" if not deep_dives_html else '<a href="#section-deep-dives">Project Deep Dives</a>'}
+      {"" if not timeline_html else '<a href="#section-timeline">Timeline</a>'}
       <a href="#section-usage">How You Use CC</a>
       <a href="#section-wins">Impressive Things</a>
       <a href="#section-friction">Where Things Go Wrong</a>
@@ -958,9 +1264,13 @@ def render_html(agg, machine_data, narratives):
       <div class="chart-title">Messages by Machine</div>
       {machine_rows}
     </div>
+    {cross_machine_html}
 
     <h2 id="section-work">What You Work On</h2>
     <div class="project-areas">{areas_html}</div>
+
+    {deep_dives_html}
+    {timeline_html}
 
     <div class="charts-row">
       {bar_chart_html("What You Wanted", goal_items, "#2563eb")}
@@ -1173,6 +1483,10 @@ def main():
         help="Skip AI narrative generation, render HTML with data charts only",
     )
     parser.add_argument(
+        "--detail", choices=["normal", "high", "max"], default="normal",
+        help="Detail level for AI analysis: normal (75 sessions), high (150), max (all sessions + full project breakdown)",
+    )
+    parser.add_argument(
         "--machine", action="append", metavar="NAME",
         help="Only collect from named machine(s); case-insensitive partial match (repeatable)",
     )
@@ -1218,7 +1532,7 @@ def main():
     # 3. Generate narratives (skip with --no-ai)
     narratives = None
     if not args.no_ai:
-        narratives = generate_narratives(agg, machine_data)
+        narratives = generate_narratives(agg, machine_data, detail_level=args.detail)
 
     # 4. Render HTML
     print("  Rendering HTML...")
