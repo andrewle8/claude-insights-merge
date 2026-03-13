@@ -144,19 +144,16 @@ if projects_dir.exists():
                         session_id = entry.get("sessionId", entry.get("session_id", ""))
 
                     # Check for tool errors
-                    content = entry.get("content", "")
+                    msg = entry.get("message", entry)
+                    content = msg.get("content", entry.get("content", ""))
                     if isinstance(content, str):
-                        if "is_error: true" in content or '"is_error":true' in content or '"is_error": true' in content:
+                        if "is_error" in content:
                             errors += 1
                     elif isinstance(content, list):
                         for block in content:
                             if isinstance(block, dict):
                                 if block.get("is_error"):
                                     errors += 1
-                                block_text = block.get("text", "")
-                                if isinstance(block_text, str):
-                                    if "is_error: true" in block_text or '"is_error":true' in block_text or '"is_error": true' in block_text:
-                                        errors += 1
 
                     # Check for interrupts
                     raw_line = json.dumps(entry)
@@ -164,10 +161,10 @@ if projects_dir.exists():
                         interrupts += 1
 
                     # Extract user messages
-                    role = entry.get("role", "")
-                    if role == "human" or role == "user":
+                    entry_type = entry.get("type", "")
+                    if entry_type == "user" or entry.get("role") in ("human", "user"):
+                        msg_content = msg.get("content", "")
                         msg_text = ""
-                        msg_content = entry.get("content", "")
                         if isinstance(msg_content, str):
                             msg_text = msg_content.strip()
                         elif isinstance(msg_content, list):
@@ -469,28 +466,26 @@ def _extract_transcript_signals_local(claude_home, days_limit=90):
                     if session_id is None:
                         session_id = entry.get("sessionId", entry.get("session_id", ""))
 
-                    content = entry.get("content", "")
+                    msg = entry.get("message", entry)
+                    content = msg.get("content", entry.get("content", ""))
                     if isinstance(content, str):
-                        if "is_error: true" in content or '"is_error":true' in content or '"is_error": true' in content:
+                        if "is_error" in content:
                             errors += 1
                     elif isinstance(content, list):
                         for block in content:
                             if isinstance(block, dict):
                                 if block.get("is_error"):
                                     errors += 1
-                                block_text = block.get("text", "")
-                                if isinstance(block_text, str):
-                                    if "is_error: true" in block_text or '"is_error":true' in block_text or '"is_error": true' in block_text:
-                                        errors += 1
 
                     raw_line = json.dumps(entry)
                     if "Request interrupted by user" in raw_line:
                         interrupts += 1
 
-                    role = entry.get("role", "")
-                    if role in ("human", "user"):
+                    entry_type = entry.get("type", "")
+                    if entry_type == "user" or entry.get("role") in ("human", "user"):
+                        msg = entry.get("message", entry)
+                        msg_content = msg.get("content", "")
                         msg_text = ""
-                        msg_content = entry.get("content", "")
                         if isinstance(msg_content, str):
                             msg_text = msg_content.strip()
                         elif isinstance(msg_content, list):
