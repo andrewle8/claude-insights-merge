@@ -74,6 +74,9 @@ python3 claude-insights-merge.py --no-ai                    # charts only, skip 
 python3 claude-insights-merge.py --machine Mac              # only this machine
 python3 claude-insights-merge.py --output ~/report.html     # save to specific path
 python3 claude-insights-merge.py --json                     # dump merged data as JSON
+python3 claude-insights-merge.py --deep-search              # mine transcripts, suggest CLAUDE.md rules
+python3 claude-insights-merge.py --deep-search --deep-search-output ~/suggestions.md  # save as Markdown
+python3 claude-insights-merge.py --deep-search --deep-search-days 30  # last 30 days only
 ```
 
 | Flag | Description |
@@ -86,6 +89,9 @@ python3 claude-insights-merge.py --json                     # dump merged data a
 | `--machine NAME` | Filter to matching machine(s), repeatable |
 | `--output PATH` | Save HTML to specific path |
 | `--json` | Dump merged quantitative data as JSON |
+| `--deep-search` | Mine session transcripts for friction patterns, suggest CLAUDE.md rules |
+| `--deep-search-output PATH` | Save deep search suggestions as Markdown |
+| `--deep-search-days N` | Analyze transcripts from last N days (default: 90) |
 
 ### Detail levels
 
@@ -135,6 +141,17 @@ $ python3 claude-insights-merge.py --stats-only
 | Facets | `~/.claude/usage-data/facets/*.json` | Per-session goals, outcomes, satisfaction, friction |
 | Session-meta | `~/.claude/usage-data/session-meta/*.json` | Per-session project path, tools, languages, tokens, timing, first prompt |
 | Stats-cache | `~/.claude/stats-cache.json` | Daily activity, model usage, session counts |
+
+### Deep Search (`--deep-search`)
+
+A separate analysis mode that goes beyond pre-computed `/insights` data. Mines raw JSONL session transcripts across all machines to find:
+
+- **User corrections** — short messages starting with "no", "don't", "stop", "revert", "actually" (indicates friction)
+- **Tool errors** — failed tool calls and their patterns
+- **Interrupted sessions** — where users stopped Claude mid-action
+- **Repeated first prompts** — instructions given in 3+ sessions (should probably be in CLAUDE.md)
+
+Feeds the evidence to Claude, which suggests specific CLAUDE.md rules — each backed by real session data. Output can be terminal (with ANSI colors) or Markdown file (with checkboxes for review).
 
 ### Beyond standard `/insights`
 
