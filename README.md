@@ -82,7 +82,7 @@ python3 claude-insights-merge.py --deep-search --deep-search-days 30  # last 30 
 | Flag | Description |
 |------|-------------|
 | `--detail {normal,high,max}` | Detail level for AI analysis (default: normal) |
-| `--stats-only` | Terminal output only, no HTML |
+| `--stats-only` | Terminal output only, no HTML or AI |
 | `--no-ai` | Skip narratives, render charts only |
 | `--no-open` | Generate HTML but don't open browser |
 | `--model {opus,sonnet,haiku}` | Model for narrative generation (default: sonnet) |

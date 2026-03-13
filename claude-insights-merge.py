@@ -25,6 +25,7 @@ Usage:
 import argparse
 import json
 import re
+import shlex
 import subprocess
 import sys
 import os
@@ -63,7 +64,7 @@ def _load_config():
             for m in machines:
                 if "claude_home" in m:
                     m["claude_home"] = str(Path(m["claude_home"]).expanduser())
-            print(f"  Loaded config from {config_file} ({len(machines)} machines)")
+            print(f"  Loaded config from {config_file} ({len(machines)} machines)", file=sys.stderr)
             return machines, config
         except (json.JSONDecodeError, Exception) as e:
             print(f"  Warning: Failed to load {config_file}: {e}", file=sys.stderr)
@@ -253,10 +254,11 @@ def ssh_run_python(host, python_cmd, script, timeout=90):
 
 def ssh_read_json_files(host, python_cmd, directory, glob_pattern="*.json"):
     """Read all JSON files in a remote directory, return as list of dicts."""
-    escaped_dir = directory.replace("\\", "\\\\")
+    # Use forward slashes — Python on Windows accepts them, avoids raw-string escaping issues
+    normalized_dir = directory.replace("\\", "/")
     script = f"""
 import json, glob, os
-files = glob.glob(os.path.join(r'{escaped_dir}', '{glob_pattern}'))
+files = glob.glob(os.path.join('{normalized_dir}', '{glob_pattern}'))
 data = []
 for f in sorted(files):
     if os.path.isfile(f):
@@ -336,9 +338,9 @@ def collect_machine_data(machine):
 
         # [1/3] Stats cache
         if is_windows:
-            stats_cmd = f"type {claude_home}\\stats-cache.json"
+            stats_cmd = f'type "{claude_home}\\stats-cache.json"'
         else:
-            stats_cmd = f"cat {claude_home}/stats-cache.json"
+            stats_cmd = f"cat {shlex.quote(claude_home + '/stats-cache.json')}"
         raw = ssh_run(host, stats_cmd)
         if raw:
             try:
@@ -375,7 +377,7 @@ def collect_all():
     machine_names = [m["name"] for m in MACHINES]
     print(f"  Collecting from {len(MACHINES)} machines in parallel...")
 
-    with ThreadPoolExecutor(max_workers=len(MACHINES)) as executor:
+    with ThreadPoolExecutor(max_workers=max(1, len(MACHINES))) as executor:
         future_to_idx = {
             executor.submit(collect_machine_data, m): i
             for i, m in enumerate(MACHINES)
@@ -719,7 +721,7 @@ def run_deep_search(args, machines):
 
     # 1. Collect transcript signals from all machines in parallel
     all_signals = [None] * len(machines)
-    with ThreadPoolExecutor(max_workers=len(machines)) as executor:
+    with ThreadPoolExecutor(max_workers=max(1, len(machines))) as executor:
         future_to_idx = {
             executor.submit(collect_transcript_signals, m, days): i
             for i, m in enumerate(machines)
@@ -834,7 +836,7 @@ def run_deep_search(args, machines):
         debug_file = OUTPUT_DIR / "deep-search-debug.txt"
         try:
             with open(debug_file, "w") as f:
-                f.write(text if "text" in dir() else "no output")
+                f.write(locals().get("text", locals().get("output", "no output")))
             print(f"  Raw output saved to {debug_file}", file=sys.stderr)
         except OSError:
             pass
@@ -1547,7 +1549,7 @@ def generate_narratives(agg, machine_data, detail_level="normal"):
         print(f"  Warning: Could not parse AI response: {e}", file=sys.stderr)
         debug_file = OUTPUT_DIR / "claude-insights-debug.txt"
         with open(debug_file, "w") as f:
-            f.write(text if "text" in dir() else "no output")
+            f.write(locals().get("text", locals().get("output", "no output")))
         print(f"  Raw output saved to {debug_file}", file=sys.stderr)
         return None
     except Exception as e:
@@ -2150,8 +2152,8 @@ def main():
         help="Don't open browser after generating HTML",
     )
     parser.add_argument(
-        "--model", choices=["opus", "sonnet", "haiku"], default="sonnet",
-        help="AI model choice (default: sonnet)",
+        "--model", choices=["opus", "sonnet", "haiku"], default=None,
+        help="AI model choice (default: from config.json or sonnet)",
     )
     parser.add_argument(
         "--no-ai", action="store_true",
@@ -2183,7 +2185,8 @@ def main():
     )
     args = parser.parse_args()
 
-    NARRATIVE_MODEL = args.model
+    if args.model:
+        NARRATIVE_MODEL = args.model
 
     # Filter machines if --machine was given
     if args.machine:
