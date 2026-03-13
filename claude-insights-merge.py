@@ -2203,7 +2203,7 @@ def main():
         return
 
     print()
-    print("  Claude Code Cross-Machine Insights (v2 — facet-based)")
+    print("  Claude Code Cross-Machine Insights (v1.0.0)")
     print("  " + "─" * 48)
 
     # 1. Collect
