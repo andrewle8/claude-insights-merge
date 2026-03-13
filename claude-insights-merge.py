@@ -17,15 +17,20 @@ Usage:
     claude-insights-merge --machine MBA          # Only collect from matching machine(s)
     claude-insights-merge --machine MBA --machine 8700K  # Multiple machines
     claude-insights-merge --output ~/report.html # Save HTML to specific path
+    claude-insights-merge --deep-search              # Mine transcripts, suggest CLAUDE.md rules
+    claude-insights-merge --deep-search --deep-search-output ~/suggestions.md  # Save as Markdown
+    claude-insights-merge --deep-search --deep-search-days 30  # Last 30 days only
 """
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import os
 import html as html_mod
 import tempfile
+import time
 import webbrowser
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -69,6 +74,141 @@ MACHINES, _CONFIG = _load_config()
 CLAUDE_CMD = _CONFIG.get("claude_cmd", "claude")
 NARRATIVE_MODEL = _CONFIG.get("default_model", "sonnet")
 OUTPUT_DIR = Path(_CONFIG.get("output_dir", tempfile.gettempdir()))
+
+_TRANSCRIPT_EXTRACTOR_SCRIPT = r'''
+import json, os, sys, time
+from pathlib import Path
+
+# Config is injected as __DEEP_SEARCH_CONFIG__ before this script runs
+claude_home = __DEEP_SEARCH_CONFIG__["claude_home"]
+days_limit = __DEEP_SEARCH_CONFIG__.get("days_limit", 90)
+
+NEGATION_PREFIXES = (
+    "no ", "no,", "don't", "stop", "wrong", "not that", "actually,",
+    "actually ", "wait,", "wait ", "revert", "undo", "nevermind",
+    "never mind",
+)
+MAX_LINES_PER_FILE = 500
+now = time.time()
+cutoff = now - (days_limit * 86400)
+
+projects_dir = Path(claude_home) / "projects"
+sessions = []
+total_files = 0
+skipped_old = 0
+
+if projects_dir.exists():
+    for jsonl_path in sorted(projects_dir.rglob("*.jsonl")):
+        path_str = str(jsonl_path)
+        if "/subagents/" in path_str or "\\subagents\\" in path_str:
+            continue
+        total_files += 1
+        try:
+            mtime = jsonl_path.stat().st_mtime
+        except OSError:
+            continue
+        if mtime < cutoff:
+            skipped_old += 1
+            continue
+
+        # Derive project slug from directory structure
+        try:
+            rel = jsonl_path.relative_to(projects_dir)
+            project_slug = str(rel.parent)
+        except ValueError:
+            project_slug = "unknown"
+
+        session_id = None
+        corrections = []
+        errors = 0
+        interrupts = 0
+        first_prompt = None
+        line_count = 0
+
+        try:
+            with open(jsonl_path, "r", errors="replace") as fh:
+                for line in fh:
+                    line_count += 1
+                    if line_count > MAX_LINES_PER_FILE:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+
+                    # Extract session_id from first line
+                    if session_id is None:
+                        session_id = entry.get("sessionId", entry.get("session_id", ""))
+
+                    # Check for tool errors
+                    content = entry.get("content", "")
+                    if isinstance(content, str):
+                        if "is_error: true" in content or '"is_error":true' in content or '"is_error": true' in content:
+                            errors += 1
+                    elif isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict):
+                                if block.get("is_error"):
+                                    errors += 1
+                                block_text = block.get("text", "")
+                                if isinstance(block_text, str):
+                                    if "is_error: true" in block_text or '"is_error":true' in block_text or '"is_error": true' in block_text:
+                                        errors += 1
+
+                    # Check for interrupts
+                    raw_line = json.dumps(entry)
+                    if "Request interrupted by user" in raw_line:
+                        interrupts += 1
+
+                    # Extract user messages
+                    role = entry.get("role", "")
+                    if role == "human" or role == "user":
+                        msg_text = ""
+                        msg_content = entry.get("content", "")
+                        if isinstance(msg_content, str):
+                            msg_text = msg_content.strip()
+                        elif isinstance(msg_content, list):
+                            parts = []
+                            for block in msg_content:
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    parts.append(block.get("text", ""))
+                                elif isinstance(block, str):
+                                    parts.append(block)
+                            msg_text = " ".join(parts).strip()
+
+                        if msg_text:
+                            if first_prompt is None:
+                                first_prompt = msg_text[:120]
+
+                            # Check for corrections
+                            if len(msg_text) < 100:
+                                lower = msg_text.lower().lstrip()
+                                for prefix in NEGATION_PREFIXES:
+                                    if lower.startswith(prefix):
+                                        corrections.append(msg_text.strip()[:80])
+                                        break
+        except (OSError, IOError):
+            continue
+
+        if session_id or first_prompt:
+            sessions.append({
+                "id": session_id or "",
+                "project": project_slug,
+                "corrections": corrections,
+                "errors": errors,
+                "interrupts": interrupts,
+                "first_prompt": first_prompt or "",
+            })
+
+print(json.dumps({
+    "sessions": sessions,
+    "total_files": total_files,
+    "skipped_old": skipped_old,
+}))
+'''
 
 # ─── SSH Helpers ─────────────────────────────────────────────────────────────
 
@@ -264,6 +404,538 @@ def collect_all():
                 }
 
     return machine_data
+
+
+# ─── Deep Search: Transcript Signal Mining ────────────────────────────────────
+
+def _extract_transcript_signals_local(claude_home, days_limit=90):
+    """Run transcript extraction logic inline for local machines."""
+    NEGATION_PREFIXES = (
+        "no ", "no,", "don't", "stop", "wrong", "not that", "actually,",
+        "actually ", "wait,", "wait ", "revert", "undo", "nevermind",
+        "never mind",
+    )
+    MAX_LINES_PER_FILE = 500
+    cutoff = time.time() - (days_limit * 86400)
+
+    projects_dir = Path(claude_home) / "projects"
+    sessions = []
+    total_files = 0
+    skipped_old = 0
+
+    if not projects_dir.exists():
+        return {"sessions": [], "total_files": 0, "skipped_old": 0}
+
+    for jsonl_path in sorted(projects_dir.rglob("*.jsonl")):
+        path_str = str(jsonl_path)
+        if "/subagents/" in path_str or "\\subagents\\" in path_str:
+            continue
+        total_files += 1
+        try:
+            mtime = jsonl_path.stat().st_mtime
+        except OSError:
+            continue
+        if mtime < cutoff:
+            skipped_old += 1
+            continue
+
+        try:
+            rel = jsonl_path.relative_to(projects_dir)
+            project_slug = str(rel.parent)
+        except ValueError:
+            project_slug = "unknown"
+
+        session_id = None
+        corrections = []
+        errors = 0
+        interrupts = 0
+        first_prompt = None
+        line_count = 0
+
+        try:
+            with open(jsonl_path, "r", errors="replace") as fh:
+                for line in fh:
+                    line_count += 1
+                    if line_count > MAX_LINES_PER_FILE:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+
+                    if session_id is None:
+                        session_id = entry.get("sessionId", entry.get("session_id", ""))
+
+                    content = entry.get("content", "")
+                    if isinstance(content, str):
+                        if "is_error: true" in content or '"is_error":true' in content or '"is_error": true' in content:
+                            errors += 1
+                    elif isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict):
+                                if block.get("is_error"):
+                                    errors += 1
+                                block_text = block.get("text", "")
+                                if isinstance(block_text, str):
+                                    if "is_error: true" in block_text or '"is_error":true' in block_text or '"is_error": true' in block_text:
+                                        errors += 1
+
+                    raw_line = json.dumps(entry)
+                    if "Request interrupted by user" in raw_line:
+                        interrupts += 1
+
+                    role = entry.get("role", "")
+                    if role in ("human", "user"):
+                        msg_text = ""
+                        msg_content = entry.get("content", "")
+                        if isinstance(msg_content, str):
+                            msg_text = msg_content.strip()
+                        elif isinstance(msg_content, list):
+                            parts = []
+                            for block in msg_content:
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    parts.append(block.get("text", ""))
+                                elif isinstance(block, str):
+                                    parts.append(block)
+                            msg_text = " ".join(parts).strip()
+
+                        if msg_text:
+                            if first_prompt is None:
+                                first_prompt = msg_text[:120]
+                            if len(msg_text) < 100:
+                                lower = msg_text.lower().lstrip()
+                                for prefix in NEGATION_PREFIXES:
+                                    if lower.startswith(prefix):
+                                        corrections.append(msg_text.strip()[:80])
+                                        break
+        except (OSError, IOError):
+            continue
+
+        if session_id or first_prompt:
+            sessions.append({
+                "id": session_id or "",
+                "project": project_slug,
+                "corrections": corrections,
+                "errors": errors,
+                "interrupts": interrupts,
+                "first_prompt": first_prompt or "",
+            })
+
+    return {
+        "sessions": sessions,
+        "total_files": total_files,
+        "skipped_old": skipped_old,
+    }
+
+
+def collect_transcript_signals(machine, days_limit=90):
+    """Collect transcript signals from a single machine."""
+    name = machine["name"]
+    claude_home = machine["claude_home"]
+
+    if machine["type"] == "local":
+        print(f"    {name}: scanning transcripts locally...")
+        result = _extract_transcript_signals_local(claude_home, days_limit)
+        print(f"    {name}: {len(result['sessions'])} sessions, "
+              f"{result['total_files']} files ({result['skipped_old']} skipped)")
+        return {"machine": name, **result}
+
+    elif machine["type"] == "ssh":
+        host = machine["host"]
+        py = machine.get("python", "python3")
+        print(f"    {name}: scanning transcripts via SSH...")
+
+        config_json = json.dumps({
+            "claude_home": claude_home,
+            "days_limit": days_limit,
+        })
+        # Inject config as a variable assignment before the script body
+        script_with_config = (
+            f"__DEEP_SEARCH_CONFIG__ = {config_json}\n"
+            + _TRANSCRIPT_EXTRACTOR_SCRIPT
+        )
+
+        raw = ssh_run_python(host, py, script_with_config, timeout=180)
+        if not raw:
+            print(f"    {name}: SSH extraction failed", file=sys.stderr)
+            return {"machine": name, "sessions": [], "total_files": 0, "skipped_old": 0}
+
+        try:
+            result = json.loads(raw.strip())
+            print(f"    {name}: {len(result.get('sessions', []))} sessions, "
+                  f"{result.get('total_files', 0)} files ({result.get('skipped_old', 0)} skipped)")
+            return {"machine": name, **result}
+        except json.JSONDecodeError as e:
+            print(f"    {name}: failed to parse extraction result: {e}", file=sys.stderr)
+            return {"machine": name, "sessions": [], "total_files": 0, "skipped_old": 0}
+
+    return {"machine": name, "sessions": [], "total_files": 0, "skipped_old": 0}
+
+
+def aggregate_transcript_signals(all_signals):
+    """Aggregate per-machine transcript signal results into a summary."""
+    total_sessions = 0
+    total_corrections = 0
+    correction_examples = []
+    frequent_errors = {}
+    interrupted_sessions = 0
+    first_prompts_all = []
+
+    for sig in all_signals:
+        machine = sig.get("machine", "unknown")
+        sessions = sig.get("sessions", [])
+        total_sessions += len(sessions)
+        machine_errors = 0
+
+        for sess in sessions:
+            corrections = sess.get("corrections", [])
+            total_corrections += len(corrections)
+            for c in corrections:
+                correction_examples.append({
+                    "text": c,
+                    "project": sess.get("project", ""),
+                    "machine": machine,
+                })
+
+            machine_errors += sess.get("errors", 0)
+
+            if sess.get("interrupts", 0) > 0:
+                interrupted_sessions += 1
+
+            fp = sess.get("first_prompt", "").strip()
+            if fp:
+                first_prompts_all.append(fp)
+
+        frequent_errors[machine] = machine_errors
+
+    # Top 30 correction examples (prioritize diversity across projects)
+    correction_examples.sort(key=lambda x: x["project"])
+    top_corrections = correction_examples[:30]
+
+    # Find repeated first prompts (appearing in 3+ sessions, normalized)
+    prompt_counts = defaultdict(int)
+    for fp in first_prompts_all:
+        normalized = fp.lower().strip()
+        prompt_counts[normalized] += 1
+    repeated_first_prompts = [
+        {"prompt": prompt, "count": count}
+        for prompt, count in sorted(prompt_counts.items(), key=lambda x: x[1], reverse=True)
+        if count >= 3
+    ]
+
+    corrections_per_session = (
+        round(total_corrections / total_sessions, 3)
+        if total_sessions > 0 else 0
+    )
+
+    return {
+        "total_sessions": total_sessions,
+        "total_corrections": total_corrections,
+        "correction_examples": top_corrections,
+        "frequent_errors": frequent_errors,
+        "interrupted_sessions": interrupted_sessions,
+        "repeated_first_prompts": repeated_first_prompts[:30],
+        "corrections_per_session": corrections_per_session,
+    }
+
+
+def build_deep_search_prompt(signals_agg, existing_claude_md):
+    """Build the AI prompt for deep search analysis."""
+    parts = []
+
+    parts.append(
+        "You are analyzing a Claude Code power user's session transcripts to find "
+        "friction patterns and suggest improvements to their CLAUDE.md configuration. "
+        "The data below comes from mining actual session transcripts across multiple machines.\n"
+    )
+
+    parts.append("\n## Transcript Signal Summary\n")
+    parts.append(json.dumps({
+        "total_sessions_scanned": signals_agg["total_sessions"],
+        "total_corrections": signals_agg["total_corrections"],
+        "corrections_per_session": signals_agg["corrections_per_session"],
+        "interrupted_sessions": signals_agg["interrupted_sessions"],
+        "errors_by_machine": signals_agg["frequent_errors"],
+    }, indent=2))
+
+    if signals_agg["correction_examples"]:
+        parts.append("\n\n## Correction Examples (user correcting Claude's behavior)\n")
+        parts.append(json.dumps(signals_agg["correction_examples"], indent=2))
+
+    if signals_agg["repeated_first_prompts"]:
+        parts.append("\n\n## Repeated First Prompts (same task started 3+ times)\n")
+        parts.append(json.dumps(signals_agg["repeated_first_prompts"], indent=2))
+
+    parts.append("\n\n## Current CLAUDE.md Content\n```\n")
+    parts.append(existing_claude_md if existing_claude_md else "(empty or not found)")
+    parts.append("\n```\n")
+
+    parts.append("""
+## Instructions
+
+Analyze the transcript signals above and suggest CLAUDE.md rules that would prevent
+the observed friction patterns. Focus on:
+
+1. **Corrections**: When the user says "no", "stop", "don't", "actually", etc., what behavior
+   were they correcting? What rule would prevent that behavior?
+2. **Repeated prompts**: If the same prompt appears many times, is there a workflow that
+   should be automated or a default that should be set?
+3. **Error patterns**: High error counts on specific machines may indicate environment-specific
+   rules needed.
+4. **Interruptions**: Frequent interruptions suggest Claude is doing something unwanted
+   that should be constrained by a rule.
+
+Output ONLY a JSON array (no markdown fencing). Each element:
+
+[
+  {
+    "rule": "<The CLAUDE.md rule text to add>",
+    "section": "<Which section it belongs in, e.g. 'General Rules', 'Code Style', 'Git Workflow', 'Testing', 'Project-Specific'>",
+    "evidence": ["<specific correction/pattern that motivated this rule>", "<another example>"],
+    "confidence": "high|medium",
+    "already_covered": false
+  }
+]
+
+Important:
+- Only suggest rules that are NOT already covered by the existing CLAUDE.md content
+- Set "already_covered" to true if the rule is already present (include these for reference but they won't be shown)
+- "high" confidence = clear repeated pattern with multiple examples
+- "medium" confidence = plausible pattern from fewer examples
+- Be specific and actionable — rules should be copy-pasteable into CLAUDE.md
+- Aim for 5-15 suggestions total
+- Do NOT suggest generic best practices — only rules motivated by the actual transcript evidence
+""")
+
+    return "".join(parts)
+
+
+def run_deep_search(args, machines):
+    """Orchestrate the deep search: collect, aggregate, analyze, render."""
+    print()
+    print("  \033[1mClaude Code Deep Search — Transcript Mining\033[0m")
+    print("  " + "─" * 48)
+    days = args.deep_search_days
+    print(f"  Scanning transcripts from last {days} days across {len(machines)} machine(s)...")
+    print()
+
+    # 1. Collect transcript signals from all machines in parallel
+    all_signals = [None] * len(machines)
+    with ThreadPoolExecutor(max_workers=len(machines)) as executor:
+        future_to_idx = {
+            executor.submit(collect_transcript_signals, m, days): i
+            for i, m in enumerate(machines)
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                all_signals[idx] = future.result()
+            except Exception as e:
+                name = machines[idx]["name"]
+                print(f"    {name}: FAILED ({e})", file=sys.stderr)
+                all_signals[idx] = {
+                    "machine": name, "sessions": [],
+                    "total_files": 0, "skipped_old": 0,
+                }
+
+    # 2. Aggregate
+    print()
+    print("  Aggregating transcript signals...")
+    agg = aggregate_transcript_signals(all_signals)
+    print(f"    Sessions: {agg['total_sessions']}, "
+          f"Corrections: {agg['total_corrections']}, "
+          f"Interrupted: {agg['interrupted_sessions']}")
+
+    if agg["total_sessions"] == 0:
+        print()
+        print("  \033[33mNo transcripts found. Nothing to analyze.\033[0m")
+        print("  Check that your machines have session data in ~/.claude/projects/")
+        print()
+        return
+
+    # 3. Read existing CLAUDE.md
+    claude_md_path = Path.home() / ".claude" / "CLAUDE.md"
+    existing_claude_md = ""
+    if claude_md_path.exists():
+        try:
+            existing_claude_md = claude_md_path.read_text(errors="replace")
+            print(f"  Read existing CLAUDE.md ({len(existing_claude_md)} chars)")
+        except OSError:
+            pass
+
+    # 4. Build prompt and call claude -p
+    print(f"  Calling {CLAUDE_CMD} -p (model={NARRATIVE_MODEL}) for analysis...")
+    prompt = build_deep_search_prompt(agg, existing_claude_md)
+
+    try:
+        env = os.environ.copy()
+        env.pop("CLAUDECODE", None)
+
+        result = subprocess.run(
+            [
+                CLAUDE_CMD, "-p",
+                "--model", NARRATIVE_MODEL,
+                "--tools", "",
+                "--no-session-persistence",
+                "--output-format", "json",
+            ],
+            input=prompt,
+            capture_output=True, text=True,
+            timeout=300,
+            env=env,
+        )
+
+        if result.returncode != 0:
+            print(f"  \033[31mError: claude -p failed: {result.stderr[:200]}\033[0m",
+                  file=sys.stderr)
+            return
+
+        output = result.stdout.strip()
+        if not output:
+            print("  \033[31mError: empty response from claude -p\033[0m", file=sys.stderr)
+            return
+
+        # Parse output — --output-format json wraps in a result object
+        try:
+            wrapper = json.loads(output)
+            if isinstance(wrapper, dict) and "result" in wrapper:
+                text = wrapper["result"]
+            elif isinstance(wrapper, dict) and "content" in wrapper:
+                content = wrapper["content"]
+                if isinstance(content, list):
+                    text = "".join(
+                        b.get("text", "") for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    )
+                else:
+                    text = str(content)
+            elif isinstance(wrapper, str):
+                text = wrapper
+            else:
+                text = output
+        except json.JSONDecodeError:
+            text = output
+
+        # Clean markdown fencing
+        text = text.strip()
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.startswith("```"):
+            text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+
+        suggestions = json.loads(text)
+
+    except subprocess.TimeoutExpired:
+        print("  \033[31mError: claude -p timed out after 300s\033[0m", file=sys.stderr)
+        return
+    except json.JSONDecodeError as e:
+        print(f"  \033[31mError: could not parse AI response: {e}\033[0m", file=sys.stderr)
+        debug_file = OUTPUT_DIR / "deep-search-debug.txt"
+        try:
+            with open(debug_file, "w") as f:
+                f.write(text if "text" in dir() else "no output")
+            print(f"  Raw output saved to {debug_file}", file=sys.stderr)
+        except OSError:
+            pass
+        return
+    except Exception as e:
+        print(f"  \033[31mError: deep search failed: {e}\033[0m", file=sys.stderr)
+        return
+
+    if not isinstance(suggestions, list):
+        print("  \033[31mError: AI response was not a JSON array\033[0m", file=sys.stderr)
+        return
+
+    # 5. Filter out already-covered suggestions
+    new_suggestions = [s for s in suggestions if not s.get("already_covered", False)]
+
+    if not new_suggestions:
+        print()
+        print("  \033[32mNo new suggestions — your CLAUDE.md already covers "
+              "the observed patterns.\033[0m")
+        print()
+        return
+
+    # 6. Render terminal output
+    print()
+    print(f"  \033[1mFound {len(new_suggestions)} suggestions\033[0m")
+    print("  " + "─" * 48)
+    print()
+
+    # Group by section
+    by_section = defaultdict(list)
+    for s in new_suggestions:
+        by_section[s.get("section", "General")].append(s)
+
+    # Sort sections, high confidence first within each
+    for section in sorted(by_section.keys()):
+        items = sorted(
+            by_section[section],
+            key=lambda x: 0 if x.get("confidence") == "high" else 1,
+        )
+        print(f"  \033[1;4m{section}\033[0m")
+        print()
+
+        for item in items:
+            conf = item.get("confidence", "medium")
+            if conf == "high":
+                badge = "\033[32m[HIGH]\033[0m"
+            else:
+                badge = "\033[33m[MEDIUM]\033[0m"
+
+            print(f"    {badge} {item.get('rule', '')}")
+
+            evidence = item.get("evidence", [])
+            if evidence:
+                for ev in evidence[:3]:
+                    print(f"      \033[2m- {ev}\033[0m")
+            print()
+
+    # 7. Write markdown file if requested
+    if args.deep_search_output:
+        md_lines = []
+        md_lines.append("# Deep Search: Suggested CLAUDE.md Improvements\n")
+        md_lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
+        md_lines.append(f"Sessions scanned: {agg['total_sessions']} | "
+                        f"Corrections found: {agg['total_corrections']} | "
+                        f"Rate: {agg['corrections_per_session']:.3f}/session\n")
+        md_lines.append("")
+
+        for section in sorted(by_section.keys()):
+            items = sorted(
+                by_section[section],
+                key=lambda x: 0 if x.get("confidence") == "high" else 1,
+            )
+            md_lines.append(f"## {section}\n")
+
+            for item in items:
+                conf = item.get("confidence", "medium").upper()
+                rule = item.get("rule", "")
+                md_lines.append(f"- [ ] **[{conf}]** {rule}")
+
+                evidence = item.get("evidence", [])
+                for ev in evidence[:3]:
+                    md_lines.append(f"  - {ev}")
+                md_lines.append("")
+
+        md_content = "\n".join(md_lines) + "\n"
+        out_path = Path(args.deep_search_output).expanduser()
+        try:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(md_content)
+            print(f"  Saved suggestions to: {out_path}")
+        except OSError as e:
+            print(f"  Error saving markdown: {e}", file=sys.stderr)
+
+    print()
+    print("  Done!")
+    print()
 
 
 # ─── Data Aggregation ────────────────────────────────────────────────────────
@@ -1502,6 +2174,18 @@ def main():
         "--output", type=Path, metavar="PATH",
         help="Save HTML to specific path instead of default /tmp location",
     )
+    parser.add_argument(
+        "--deep-search", action="store_true",
+        help="Mine session transcripts for friction patterns and suggest CLAUDE.md improvements",
+    )
+    parser.add_argument(
+        "--deep-search-output", type=Path, metavar="PATH",
+        help="Save deep search suggestions to Markdown file",
+    )
+    parser.add_argument(
+        "--deep-search-days", type=int, default=90, metavar="N",
+        help="Analyze transcripts from last N days (default: 90)",
+    )
     args = parser.parse_args()
 
     NARRATIVE_MODEL = args.model
@@ -1515,6 +2199,10 @@ def main():
             print(f"  Available: {[m['name'] for m in MACHINES]}", file=sys.stderr)
             sys.exit(1)
         MACHINES = filtered
+
+    if args.deep_search:
+        run_deep_search(args, MACHINES)
+        return
 
     print()
     print("  Claude Code Cross-Machine Insights (v2 — facet-based)")
