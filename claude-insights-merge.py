@@ -76,6 +76,56 @@ CLAUDE_CMD = _CONFIG.get("claude_cmd", "claude")
 NARRATIVE_MODEL = _CONFIG.get("default_model", "sonnet")
 OUTPUT_DIR = Path(_CONFIG.get("output_dir", tempfile.gettempdir()))
 
+
+def _extract_json(text, want="object"):
+    """Parse the first complete JSON value out of a possibly-chatty AI response.
+
+    The `claude -p` subprocess inherits the local environment (MCP servers,
+    CLAUDE.md, hooks), so the model sometimes wraps the JSON in prose
+    ("Here is the report. {...}") or markdown fences. Strip fences, then scan
+    for the first balanced object/array and parse just that span. Returns the
+    parsed value, or None if no valid JSON is found.
+    """
+    if not text:
+        return None
+    t = text.strip()
+    if t.startswith("```"):
+        nl = t.find("\n")
+        t = t[nl + 1:] if nl != -1 else t[3:]
+        if t.endswith("```"):
+            t = t[:-3]
+        t = t.strip()
+    open_ch, close_ch = ("[", "]") if want == "array" else ("{", "}")
+    start = t.find(open_ch)
+    if start == -1:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(t)):
+        c = t[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c == open_ch:
+            depth += 1
+        elif c == close_ch:
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(t[start:i + 1])
+                except (json.JSONDecodeError, ValueError):
+                    return None
+    return None
+
+
 _TRANSCRIPT_EXTRACTOR_SCRIPT = r'''
 import json, os, sys, time
 from pathlib import Path
@@ -811,7 +861,9 @@ def run_deep_search(args, machines):
             [
                 CLAUDE_CMD, "-p",
                 "--model", NARRATIVE_MODEL,
-                "--tools", "",
+                "--strict-mcp-config",
+                "--append-system-prompt",
+                "Respond with only the requested JSON. No preamble, commentary, or markdown fences.",
                 "--no-session-persistence",
                 "--output-format", "json",
             ],
@@ -852,17 +904,9 @@ def run_deep_search(args, machines):
         except json.JSONDecodeError:
             text = output
 
-        # Clean markdown fencing
-        text = text.strip()
-        if text.startswith("```json"):
-            text = text[7:]
-        if text.startswith("```"):
-            text = text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-
-        suggestions = json.loads(text)
+        suggestions = _extract_json(text, "array")
+        if suggestions is None:
+            raise json.JSONDecodeError("no JSON array in AI response", text or "", 0)
 
     except subprocess.TimeoutExpired:
         print("  \033[31mError: claude -p timed out after 300s\033[0m", file=sys.stderr)
@@ -1528,7 +1572,9 @@ def generate_narratives(agg, machine_data, detail_level="normal"):
             [
                 CLAUDE_CMD, "-p",
                 "--model", NARRATIVE_MODEL,
-                "--tools", "",
+                "--strict-mcp-config",
+                "--append-system-prompt",
+                "Respond with only the requested JSON. No preamble, commentary, or markdown fences.",
                 "--no-session-persistence",
                 "--output-format", "json",
             ],
@@ -1564,17 +1610,9 @@ def generate_narratives(agg, machine_data, detail_level="normal"):
         except json.JSONDecodeError:
             text = output
 
-        # Clean markdown fencing
-        text = text.strip()
-        if text.startswith("```json"):
-            text = text[7:]
-        if text.startswith("```"):
-            text = text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-
-        narratives = json.loads(text)
+        narratives = _extract_json(text, "object")
+        if narratives is None:
+            raise json.JSONDecodeError("no JSON object in AI response", text or "", 0)
         print("  AI narrative generated successfully")
         return narratives
 
@@ -2239,7 +2277,7 @@ def main():
         return
 
     print()
-    print("  Claude Code Cross-Machine Insights (v1.1.0)")
+    print("  Claude Code Cross-Machine Insights (v1.1.1)")
     print("  " + "─" * 48)
 
     # 1. Collect
