@@ -15,3 +15,8 @@ cached-data/
 # Output files
 *.html
 !user-templates/*.html
+
+# Editor swap files
+*.swp
+*.swo
+*~

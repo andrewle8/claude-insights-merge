@@ -85,7 +85,7 @@ python3 claude-insights-merge.py --deep-search --deep-search-days 30  # last 30 
 | `--stats-only` | Terminal output only, no HTML or AI |
 | `--no-ai` | Skip narratives, render charts only |
 | `--no-open` | Generate HTML but don't open browser |
-| `--model {opus,sonnet,haiku}` | Model for narrative generation (default: sonnet) |
+| `--model {opus,sonnet,haiku,fable}` | Model for narrative generation (default: sonnet) |
 | `--machine NAME` | Filter to matching machine(s), repeatable |
 | `--output PATH` | Save HTML to specific path |
 | `--json` | Dump merged quantitative data as JSON |

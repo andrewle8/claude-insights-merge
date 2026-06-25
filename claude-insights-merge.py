@@ -12,7 +12,7 @@ Usage:
     claude-insights-merge --stats-only           # Terminal output, no AI
     claude-insights-merge --no-open              # Generate HTML but don't open browser
     claude-insights-merge --json                 # Dump merged data as JSON
-    claude-insights-merge --model opus           # Use a specific model (opus/sonnet/haiku)
+    claude-insights-merge --model opus           # Use a specific model (opus/sonnet/haiku/fable)
     claude-insights-merge --no-ai                # Skip AI narratives, render charts only
     claude-insights-merge --machine MBA          # Only collect from matching machine(s)
     claude-insights-merge --machine MBA --machine 8700K  # Multiple machines
@@ -89,7 +89,7 @@ NEGATION_PREFIXES = (
     "actually ", "wait,", "wait ", "revert", "undo", "nevermind",
     "never mind",
 )
-MAX_LINES_PER_FILE = 500
+MAX_LINES_PER_FILE = 1500
 now = time.time()
 cutoff = now - (days_limit * 86400)
 
@@ -161,9 +161,15 @@ if projects_dir.exists():
                     if "Request interrupted by user" in raw_line:
                         interrupts += 1
 
-                    # Extract user messages
+                    # Extract user messages (skip injected/synthetic turns:
+                    # modern Claude Code marks hook context, slash-command
+                    # output, caveats, and system reminders with isMeta=True)
                     entry_type = entry.get("type", "")
-                    if entry_type == "user" or entry.get("role") in ("human", "user"):
+                    is_real_user = (
+                        (entry_type == "user" or entry.get("role") in ("human", "user"))
+                        and not entry.get("isMeta")
+                    )
+                    if is_real_user:
                         msg_content = msg.get("content", "")
                         msg_text = ""
                         if isinstance(msg_content, str):
@@ -178,16 +184,28 @@ if projects_dir.exists():
                             msg_text = " ".join(parts).strip()
 
                         if msg_text:
-                            if first_prompt is None:
-                                first_prompt = msg_text[:120]
+                            stripped = msg_text.lstrip()
+                            synthetic = (
+                                stripped.startswith((
+                                    "<command", "<local-command", "<bash-",
+                                    "Caveat:", "[Request interrupted",
+                                ))
+                                or "<command-name>" in msg_text
+                                or "local-command-stdout" in msg_text
+                                or "system-reminder" in msg_text
+                                or stripped.startswith("This session is being continued")
+                            )
+                            if not synthetic:
+                                if first_prompt is None:
+                                    first_prompt = msg_text[:120]
 
-                            # Check for corrections
-                            if len(msg_text) < 100:
-                                lower = msg_text.lower().lstrip()
-                                for prefix in NEGATION_PREFIXES:
-                                    if lower.startswith(prefix):
-                                        corrections.append(msg_text.strip()[:80])
-                                        break
+                                # Check for corrections
+                                if len(msg_text) < 100:
+                                    lower = stripped.lower()
+                                    for prefix in NEGATION_PREFIXES:
+                                        if lower.startswith(prefix):
+                                            corrections.append(msg_text.strip()[:80])
+                                            break
         except (OSError, IOError):
             continue
 
@@ -414,7 +432,7 @@ def _extract_transcript_signals_local(claude_home, days_limit=90):
         "actually ", "wait,", "wait ", "revert", "undo", "nevermind",
         "never mind",
     )
-    MAX_LINES_PER_FILE = 500
+    MAX_LINES_PER_FILE = 1500
     cutoff = time.time() - (days_limit * 86400)
 
     projects_dir = Path(claude_home) / "projects"
@@ -483,8 +501,14 @@ def _extract_transcript_signals_local(claude_home, days_limit=90):
                     if "Request interrupted by user" in raw_line:
                         interrupts += 1
 
+                    # Skip injected/synthetic user turns (isMeta=True): hook
+                    # context, slash-command output, caveats, system reminders
                     entry_type = entry.get("type", "")
-                    if entry_type == "user" or entry.get("role") in ("human", "user"):
+                    is_real_user = (
+                        (entry_type == "user" or entry.get("role") in ("human", "user"))
+                        and not entry.get("isMeta")
+                    )
+                    if is_real_user:
                         msg = entry.get("message", entry)
                         msg_content = msg.get("content", "")
                         msg_text = ""
@@ -500,14 +524,26 @@ def _extract_transcript_signals_local(claude_home, days_limit=90):
                             msg_text = " ".join(parts).strip()
 
                         if msg_text:
-                            if first_prompt is None:
-                                first_prompt = msg_text[:120]
-                            if len(msg_text) < 100:
-                                lower = msg_text.lower().lstrip()
-                                for prefix in NEGATION_PREFIXES:
-                                    if lower.startswith(prefix):
-                                        corrections.append(msg_text.strip()[:80])
-                                        break
+                            stripped = msg_text.lstrip()
+                            synthetic = (
+                                stripped.startswith((
+                                    "<command", "<local-command", "<bash-",
+                                    "Caveat:", "[Request interrupted",
+                                ))
+                                or "<command-name>" in msg_text
+                                or "local-command-stdout" in msg_text
+                                or "system-reminder" in msg_text
+                                or stripped.startswith("This session is being continued")
+                            )
+                            if not synthetic:
+                                if first_prompt is None:
+                                    first_prompt = msg_text[:120]
+                                if len(msg_text) < 100:
+                                    lower = stripped.lower()
+                                    for prefix in NEGATION_PREFIXES:
+                                        if lower.startswith(prefix):
+                                            corrections.append(msg_text.strip()[:80])
+                                            break
         except (OSError, IOError):
             continue
 
@@ -2152,7 +2188,7 @@ def main():
         help="Don't open browser after generating HTML",
     )
     parser.add_argument(
-        "--model", choices=["opus", "sonnet", "haiku"], default=None,
+        "--model", choices=["opus", "sonnet", "haiku", "fable"], default=None,
         help="AI model choice (default: from config.json or sonnet)",
     )
     parser.add_argument(
@@ -2203,7 +2239,7 @@ def main():
         return
 
     print()
-    print("  Claude Code Cross-Machine Insights (v1.0.0)")
+    print("  Claude Code Cross-Machine Insights (v1.1.0)")
     print("  " + "─" * 48)
 
     # 1. Collect
