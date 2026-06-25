@@ -1071,6 +1071,15 @@ def aggregate_all(machine_data):
             sessions = len(m["session_meta"])
         per_machine.append({"name": m["name"], "messages": msgs, "sessions": sessions})
 
+    # Precompute machine shares so the AI reports them instead of dividing.
+    # LLMs conflate session-share with message-share (e.g. "70% of sessions"
+    # when 70% is the message figure) — hand them both, labeled.
+    _tot_sessions = sum(pm["sessions"] for pm in per_machine)
+    _tot_messages = sum(pm["messages"] for pm in per_machine)
+    for pm in per_machine:
+        pm["session_pct"] = round(pm["sessions"] / _tot_sessions * 100, 1) if _tot_sessions else 0
+        pm["message_pct"] = round(pm["messages"] / _tot_messages * 100, 1) if _tot_messages else 0
+
     # ── Merge facets (qualitative data) ──
     all_facets = []
     seen_sessions = set()
@@ -1421,6 +1430,10 @@ def _build_prompt_text(machines_str, machine_count, stats_summary, project_secti
         "Generate a comprehensive insights analysis as a JSON object. "
         "Be specific, reference actual projects and patterns from the facet summaries. "
         "Be honest about friction. The tone should be direct and personalized.\n\n"
+        "When describing how work splits across machines, use the per_machine "
+        "session_pct and message_pct fields verbatim and keep them distinct: write "
+        "'<n>% of sessions' or '<n>% of messages', never a generic 'share' or "
+        "'volume'. Do not compute percentages yourself.\n\n"
     )
 
     if detail_level == "max":
@@ -2277,7 +2290,7 @@ def main():
         return
 
     print()
-    print("  Claude Code Cross-Machine Insights (v1.1.1)")
+    print("  Claude Code Cross-Machine Insights (v1.1.2)")
     print("  " + "─" * 48)
 
     # 1. Collect
